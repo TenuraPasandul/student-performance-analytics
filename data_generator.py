@@ -39,9 +39,24 @@ def load_from_mongodb():
             continue
         count = db[name].estimated_document_count()
         print(f"   Loading '{name}' ({count:,} docs) → {key}")
-        docs = list(db[name].find({}, {'_id': 0}))
-        if docs:
-            data[key] = pd.DataFrame(docs)
+        # Directly pass the cursor to pd.DataFrame to save memory (avoids creating a massive list of dicts)
+        df = pd.DataFrame(db[name].find({}, {'_id': 0}))
+        
+        if len(df) > 0:
+            # Memory Optimization: Downcast numeric types and use categories for strings
+            for col in df.columns:
+                if df[col].dtype == 'object':
+                    # Convert string objects to category if cardinality is low
+                    if df[col].nunique() < len(df) * 0.5:
+                        df[col] = df[col].astype('category')
+                elif pd.api.types.is_numeric_dtype(df[col]):
+                    # Downcast numeric types (e.g. float64 -> float32, int64 -> int32)
+                    if pd.api.types.is_integer_dtype(df[col]):
+                        df[col] = pd.to_numeric(df[col], downcast='integer')
+                    else:
+                        df[col] = pd.to_numeric(df[col], downcast='float')
+            
+            data[key] = df
             print(f"     ✅ {len(data[key]):,} rows | Cols: {list(data[key].columns)}")
     client.close()
 
