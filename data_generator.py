@@ -1,17 +1,8 @@
 """
-MongoDB Data Loader for the Student Performance Analytics Dashboard.
-Connects to MongoDB Atlas and loads the student_analytics data warehouse.
-
-Database: student_analytics
-Collections:
-  - dim_student_profile     → students (32,593 docs)
-  - dim_courses             → courses (22 docs)
-  - dim_assessments         → assessments dimension
-  - fact_assessment_summary → student assessment facts (25,843 docs)
-  - fact_lms_engagement_summary → VLE/LMS engagement facts
-  - fact_student_survey_simulated → student survey data
-  - course_summary          → pre-aggregated course stats (22 docs)
-  - student_success_analytics → combined analytics
+MongoDB Loader & KPI Engine — Uses ONLY 3 collections:
+  1. course_summary → Executive Dashboard
+  2. student_success_analytics → Intervention Dashboard
+  3. student_success_with_survey → Diagnostic Dashboard
 """
 import pandas as pd
 from pymongo import MongoClient
@@ -19,114 +10,178 @@ from pymongo import MongoClient
 MONGO_URI = "mongodb+srv://biuser:bi7890@cluster0.sf6hgbj.mongodb.net/?appName=Cluster0"
 DB_NAME = "student_analytics"
 
-# Explicit mapping: internal key → MongoDB collection name
-COLLECTION_MAP = {
-    'students':             'dim_student_profile',
-    'courses':              'dim_courses',
-    'assessments':          'dim_assessments',
-    'student_assessments':  'fact_assessment_summary',
-    'student_vle':          'fact_lms_engagement_summary',
-    'student_survey':       'fact_student_survey_simulated',
+COLLECTIONS = {
     'course_summary':       'course_summary',
     'student_success':      'student_success_analytics',
-    'student_success_survey': 'student_success_with_survey',
+    'student_survey':       'student_success_with_survey',
 }
 
 
 def load_from_mongodb():
-    """Connect to MongoDB Atlas and load all collections into DataFrames."""
+    """Load the 3 required collections from MongoDB Atlas."""
     print("⏳ Connecting to MongoDB Atlas...")
-
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
         client.admin.command('ping')
-        print("✅ Connected to MongoDB Atlas!")
+        print("✅ Connected!")
     except Exception as e:
-        print(f"❌ MongoDB connection failed: {e}")
+        print(f"❌ Connection failed: {e}")
         return None
 
     db = client[DB_NAME]
     available = db.list_collection_names()
-    print(f"   Database: '{DB_NAME}'")
-    print(f"   Collections: {available}")
+    print(f"   Database: '{DB_NAME}' | Available: {available}")
 
     data = {}
-    for key, coll_name in COLLECTION_MAP.items():
-        if coll_name not in available:
-            print(f"   ⚠️ Collection '{coll_name}' not found, skipping → {key}")
+    for key, name in COLLECTIONS.items():
+        if name not in available:
+            print(f"   ⚠️ '{name}' not found")
             continue
-
-        coll = db[coll_name]
-        count = coll.estimated_document_count()
-        print(f"   Loading '{coll_name}' ({count:,} docs) → {key}")
-
-        docs = list(coll.find({}, {'_id': 0}))
+        count = db[name].estimated_document_count()
+        print(f"   Loading '{name}' ({count:,} docs) → {key}")
+        docs = list(db[name].find({}, {'_id': 0}))
         if docs:
-            df = pd.DataFrame(docs)
-            data[key] = df
-            print(f"     ✅ {len(df):,} rows | Columns: {list(df.columns)}")
-        else:
-            print(f"     ⚠️ Empty collection")
-
+            data[key] = pd.DataFrame(docs)
+            print(f"     ✅ {len(data[key]):,} rows | Cols: {list(data[key].columns)}")
     client.close()
 
-    if 'students' not in data:
-        print("\n❌ Missing required collection: dim_student_profile")
+    if not data:
+        print("❌ No collections loaded.")
         return None
-
-    print(f"\n✅ Loaded {len(data)} collections from MongoDB!")
+    print(f"\n✅ Loaded {len(data)} collections.")
     return data
 
 
-def compute_kpis(data):
-    """Compute KPI values from the loaded data."""
-    df_students = data.get('students', pd.DataFrame())
-    if len(df_students) == 0:
-        return {'total_students': 0, 'total_courses': 0, 'avg_score': 0,
-                'pass_rate': 0, 'withdrawal_rate': 0, 'avg_engagement': 0}
+def _col(df, candidates):
+    """Find first matching column name."""
+    for c in candidates:
+        if c in df.columns: return c
+    return None
 
-    total_students = df_students['id_student'].nunique() if 'id_student' in df_students.columns else len(df_students)
 
-    # Total courses from course_summary or dim_courses or student profiles
-    if 'course_summary' in data and len(data['course_summary']) > 0:
-        total_courses = len(data['course_summary'])
-    elif 'courses' in data and len(data['courses']) > 0:
-        total_courses = len(data['courses'])
-    elif 'code_module' in df_students.columns:
-        total_courses = df_students[['code_module', 'code_presentation']].drop_duplicates().shape[0]
-    else:
-        total_courses = 0
+def _num(df, col):
+    """Safe numeric conversion."""
+    if col and col in df.columns:
+        return pd.to_numeric(df[col], errors='coerce').fillna(0)
+    return pd.Series([0]*len(df))
 
-    # Average assessment score from fact_assessment_summary
-    avg_score = 0
-    df_sa = data.get('student_assessments', pd.DataFrame())
-    if len(df_sa) > 0 and 'average_score' in df_sa.columns:
-        avg_score = pd.to_numeric(df_sa['average_score'], errors='coerce').mean()
-    elif len(df_sa) > 0 and 'score' in df_sa.columns:
-        avg_score = pd.to_numeric(df_sa['score'], errors='coerce').mean()
 
-    # Pass rate and withdrawal rate
-    pass_rate = 0
-    withdrawal_rate = 0
-    if 'final_result' in df_students.columns:
-        total = len(df_students)
-        pass_rate = (df_students['final_result'].isin(['Pass', 'Distinction']).sum() / total) * 100
-        withdrawal_rate = (df_students['final_result'] == 'Withdrawn').sum() / total * 100
+# ==================== EXECUTIVE KPIs (course_summary) ====================
+def compute_executive_kpis(data):
+    cs = data.get('course_summary', pd.DataFrame())
+    if len(cs) == 0:
+        return dict(total_courses=0, pass_rate=0, withdrawal_rate=0, avg_score=0,
+                    risk_density=0, avg_engagement=0, health_index=0)
 
-    # Average engagement from fact_lms_engagement_summary
-    avg_engagement = 0
-    df_vle = data.get('student_vle', pd.DataFrame())
-    if len(df_vle) > 0:
-        for click_col in ['total_clicks', 'sum_click', 'total_click', 'average_clicks']:
-            if click_col in df_vle.columns:
-                avg_engagement = pd.to_numeric(df_vle[click_col], errors='coerce').mean()
-                break
+    total_courses = len(cs)
+    pr = _num(cs, 'pass_rate').mean()
+    wr = _num(cs, 'withdrawal_rate').mean()
+    avg_score = _num(cs, 'average_score').mean()
 
-    return {
-        'total_students': total_students,
-        'total_courses': total_courses,
-        'avg_score': round(avg_score, 1) if pd.notna(avg_score) else 0,
-        'pass_rate': round(pass_rate, 1),
-        'withdrawal_rate': round(withdrawal_rate, 1),
-        'avg_engagement': round(avg_engagement, 0) if pd.notna(avg_engagement) else 0
-    }
+    total_s = _num(cs, 'total_students').sum()
+    total_hr = _num(cs, 'high_risk_students').sum()
+    risk_density = round((total_hr / total_s * 100), 1) if total_s > 0 else 0
+
+    ac = _col(cs, ['average_clicks', 'average_active_days'])
+    avg_eng = _num(cs, ac).mean() if ac else 0
+
+    health = round(pr - wr, 1)
+
+    return dict(total_courses=total_courses, pass_rate=round(pr, 1), withdrawal_rate=round(wr, 1),
+                avg_score=round(avg_score, 1), risk_density=risk_density,
+                avg_engagement=round(avg_eng, 0), health_index=health)
+
+
+# ==================== INTERVENTION KPIs (student_success_analytics) ====================
+def compute_intervention_kpis(data):
+    ss = data.get('student_success', pd.DataFrame())
+    if len(ss) == 0:
+        return dict(high_risk=0, medium_risk=0, low_risk=0, avg_engagement=0,
+                    avg_attendance=0, predicted_wd=0, immediate=0)
+
+    rc = _col(ss, ['risk_level'])
+    high = med = low = 0
+    if rc:
+        vc = ss[rc].value_counts()
+        high = int(vc.get('High Risk', vc.get('High', 0)))
+        med = int(vc.get('Medium Risk', vc.get('Medium', 0)))
+        low = int(vc.get('Low Risk', vc.get('Low', 0)))
+
+    ec = _col(ss, ['total_clicks', 'average_clicks', 'engagement_score'])
+    avg_eng = round(_num(ss, ec).mean(), 0) if ec else 0
+
+    ac = _col(ss, ['active_days', 'total_active_days', 'attendance'])
+    avg_att = round(_num(ss, ac).mean(), 0) if ac else 0
+
+    return dict(high_risk=high, medium_risk=med, low_risk=low,
+                avg_engagement=avg_eng, avg_attendance=avg_att,
+                predicted_wd=high, immediate=high)
+
+
+# ==================== DIAGNOSTIC KPIs (student_success_with_survey) ====================
+def compute_diagnostic_kpis(data):
+    sv = data.get('student_survey', pd.DataFrame())
+    if len(sv) == 0:
+        return dict(avg_stress=0, avg_wellbeing=0, avg_lms=0, avg_satisfaction=0,
+                    high_concern=0, avg_performance=0)
+
+    avg_stress = round(_num(sv, 'stress_level').mean(), 1) if 'stress_level' in sv.columns else 0
+    avg_lms = round(_num(sv, 'lms_usefulness').mean(), 1) if 'lms_usefulness' in sv.columns else 0
+
+    sc = _col(sv, ['student_satisfaction_score', 'teaching_satisfaction'])
+    avg_sat = round(_num(sv, sc).mean(), 1) if sc else 0
+
+    high_concern = 0
+    avg_wellbeing = 0
+    if 'wellbeing_concern_level' in sv.columns:
+        high_concern = int(sv['wellbeing_concern_level'].str.lower().str.contains('high', na=False).sum())
+        cmap = {'low concern':4,'low':4,'moderate concern':3,'moderate':3,'medium':3,'high concern':1,'high':1}
+        avg_wellbeing = round(sv['wellbeing_concern_level'].str.lower().map(cmap).fillna(3).mean(), 1)
+
+    pc = _col(sv, ['average_score', 'score'])
+    avg_perf = round(_num(sv, pc).mean(), 1) if pc else 0
+
+    return dict(avg_stress=avg_stress, avg_wellbeing=avg_wellbeing, avg_lms=avg_lms,
+                avg_satisfaction=avg_sat, high_concern=high_concern, avg_performance=avg_perf)
+
+
+# ==================== DATA QUALITY ====================
+def compute_data_quality(data):
+    total_rows = sum(len(df) for df in data.values())
+    total_dupes = sum(df.duplicated().sum() for df in data.values())
+    total_missing = sum(df.isnull().sum().sum() for df in data.values())
+    total_cells = sum(df.size for df in data.values())
+    miss_pct = round(total_missing / total_cells * 100, 2) if total_cells > 0 else 0
+    dup_pct = round(total_dupes / total_rows * 100, 2) if total_rows > 0 else 0
+    trust = round(max(0, 100 - miss_pct - dup_pct), 1)
+    tables = []
+    for key, df in data.items():
+        tables.append({'table': key, 'rows': len(df), 'columns': len(df.columns),
+                       'missing_pct': round(df.isnull().sum().sum() / df.size * 100, 2) if df.size > 0 else 0,
+                       'duplicates': int(df.duplicated().sum())})
+    return dict(trust_score=trust, missing_pct=miss_pct, duplicate_pct=dup_pct, tables=tables)
+
+
+# ==================== SHARED FILTER ====================
+def filter_by(df, module='All', presentation='All'):
+    """Apply module/presentation filters to any DataFrame that has those columns."""
+    if len(df) == 0: return df
+    if module != 'All' and 'code_module' in df.columns:
+        df = df[df['code_module'] == module]
+    if presentation != 'All' and 'code_presentation' in df.columns:
+        df = df[df['code_presentation'] == presentation]
+    return df
+
+
+def get_at_risk_table(data, module='All', pres='All', risk_filter='All', search=''):
+    """Build At-Risk Watchlist from student_success_analytics."""
+    ss = data.get('student_success', pd.DataFrame())
+    if len(ss) == 0: return pd.DataFrame()
+    tbl = filter_by(ss.copy(), module, pres)
+    if 'risk_level' in tbl.columns and risk_filter != 'All':
+        tbl = tbl[tbl['risk_level'] == risk_filter]
+    if search and 'id_student' in tbl.columns:
+        tbl = tbl[tbl['id_student'].astype(str).str.contains(str(search), na=False)]
+    cols = [c for c in ['id_student','code_module','risk_level','average_score',
+                        'total_clicks','active_days','engagement_level','final_result'] if c in tbl.columns]
+    return tbl[cols].head(200) if cols else pd.DataFrame()

@@ -1,515 +1,296 @@
-"""
-Student Performance Analytics Dashboard
-Business Intelligence Dashboard - Open University Learning Analytics Dataset (OULAD)
-Built with Python Dash & Plotly — Connected to MongoDB Atlas
-"""
+"""Student Performance BI Dashboard — 3 Collections, 4 Tabs."""
 import dash
-from dash import dcc, html, Input, Output, State
+from dash import dcc, html, dash_table, Input, Output, State
 import pandas as pd
 from datetime import datetime
 
-from data_generator import load_from_mongodb, compute_kpis
-from charts import (
-    build_course_pass_rate, build_assessment_score_by_type,
-    build_final_results_donut, build_gender_pie, build_age_band_bar,
-    build_education_bar, build_engagement_scatter, build_daily_activity,
-    build_top_resources, compute_summary
-)
+from data_generator import (load_from_mongodb, compute_executive_kpis, compute_intervention_kpis,
+    compute_diagnostic_kpis, compute_data_quality, filter_by, get_at_risk_table)
+from charts import (exec_course_health, exec_outcome_donut, exec_resource_efficiency, exec_risk_density,
+    exec_performance_trend, intv_risk_donut, intv_engage_vs_perf, intv_silent_struggler, intv_risk_by_category,
+    diag_stress_vs_perf, diag_wellbeing_bar, diag_lms_friction, diag_sentiment_pie, diag_correlation,
+    cross_retention_funnel, cross_success_gap)
 
-# ===========================
-# Load Data from MongoDB
-# ===========================
-print("=" * 60)
-print("  Student Performance Analytics Dashboard")
-print("  Loading data from MongoDB Atlas...")
-print("=" * 60)
+# ===== LOAD =====
+print("="*60+"\n  Student Performance BI Dashboard\n"+"="*60)
+DATA = load_from_mongodb()
+if DATA is None: DATA = {}
+for k in ['course_summary','student_success','student_survey']:
+    DATA.setdefault(k, pd.DataFrame())
 
-raw_data = load_from_mongodb()
+EK = compute_executive_kpis(DATA)
+IK = compute_intervention_kpis(DATA)
+DK = compute_diagnostic_kpis(DATA)
+DQ = compute_data_quality(DATA)
+print(f"✅ Ready! Trust Score: {DQ['trust_score']}%")
 
-if raw_data is None:
-    print("\n⚠️  Could not load from MongoDB. Generating synthetic data...")
-    # Inline synthetic fallback
-    import numpy as np
-    np.random.seed(42)
-    n = 1000
-    modules = ['AAA', 'BBB', 'CCC', 'DDD', 'EEE', 'FFF', 'GGG']
-    presentations = ['2013J', '2014B', '2014J']
-    students = []
-    for i in range(n):
-        result = np.random.choice(['Pass', 'Fail', 'Distinction', 'Withdrawn'], p=[0.35, 0.15, 0.20, 0.30])
-        students.append({
-            'id_student': 10000 + i,
-            'code_module': np.random.choice(modules),
-            'code_presentation': np.random.choice(presentations),
-            'gender': np.random.choice(['M', 'F']),
-            'region': np.random.choice(['London Region', 'Scotland', 'South East Region', 'West Midlands Region']),
-            'highest_education': np.random.choice(['A Level or Equivalent', 'HE Qualification', 'Lower Than A Level', 'Post Graduate Qualification']),
-            'age_band': np.random.choice(['0-35', '35-55', '55<=']),
-            'disability': np.random.choice(['Y', 'N']),
-            'final_result': result
-        })
-    DATA = {
-        'students': pd.DataFrame(students),
-        'assessments': pd.DataFrame(),
-        'student_assessments': pd.DataFrame(),
-        'student_vle': pd.DataFrame(),
-        'vle': pd.DataFrame(),
-        'courses': pd.DataFrame()
-    }
-else:
-    DATA = raw_data
-
-# Ensure all required keys exist
-for key in ['students', 'assessments', 'student_assessments', 'student_vle', 'vle', 'courses']:
-    if key not in DATA:
-        DATA[key] = pd.DataFrame()
-
-# Ensure numeric types for key columns
-if len(DATA['student_assessments']) > 0 and 'score' in DATA['student_assessments'].columns:
-    DATA['student_assessments']['score'] = pd.to_numeric(DATA['student_assessments']['score'], errors='coerce')
-
-if len(DATA['student_vle']) > 0 and 'sum_click' in DATA['student_vle'].columns:
-    DATA['student_vle']['sum_click'] = pd.to_numeric(DATA['student_vle']['sum_click'], errors='coerce')
-
-KPIS = compute_kpis(DATA)
-SUMMARY = compute_summary(DATA)
-
-print("\n📊 KPIs computed:")
-for k, v in KPIS.items():
-    print(f"   {k}: {v}")
-print(f"\n✅ Dashboard data ready! ({len(DATA['students']):,} student records)")
-
-# ===========================
-# App Initialization
-# ===========================
-app = dash.Dash(
-    __name__,
-    title='Student Performance Analytics Dashboard',
-    update_title='Loading...',
-    meta_tags=[{'name': 'viewport', 'content': 'width=device-width, initial-scale=1.0'}],
-    suppress_callback_exceptions=True
-)
+# ===== APP =====
+app = dash.Dash(__name__, title='Student Performance BI', suppress_callback_exceptions=True,
+    meta_tags=[{'name':'viewport','content':'width=device-width, initial-scale=1.0'}])
 server = app.server
+CL = {'b':'#2563EB','g':'#10B981','o':'#F59E0B','p':'#8B5CF6','r':'#EF4444','t':'#14B8A6','pk':'#EC4899','i':'#6366F1'}
 
-# Color palette
-COLORS = {
-    'kpi_blue': '#2563EB',
-    'kpi_green': '#10B981',
-    'kpi_orange': '#F59E0B',
-    'kpi_purple': '#8B5CF6',
-    'kpi_red': '#EF4444',
-    'kpi_teal': '#14B8A6',
-}
-
-
-# ===========================
-# Helper Components
-# ===========================
-def kpi_card(icon, label, value, trend_val, trend_dir, color):
+# ===== HELPERS =====
+def kpi(icon, label, value, color):
     return html.Div([
-        html.Div(style={
-            'position': 'absolute', 'top': 0, 'left': 0,
-            'width': '100%', 'height': '4px',
-            'background': f'linear-gradient(90deg, {color}, {color}88)',
-            'borderRadius': '16px 16px 0 0'
-        }),
-        html.Div(icon, className='kpi-icon', style={
-            'background': f'{color}15', 'color': color
-        }),
-        html.Div(str(value), className='kpi-value', style={'color': color}),
-        html.Div(label, className='kpi-label'),
-        html.Div([
-            html.Span('▲ ' if trend_dir == 'up' else '▼ '),
-            html.Span(trend_val)
-        ], className=f'kpi-trend {trend_dir}')
-    ], className='kpi-card')
+        html.Div(style={'position':'absolute','top':0,'left':0,'width':'100%','height':'4px',
+            'background':f'linear-gradient(90deg,{color},{color}88)','borderRadius':'16px 16px 0 0'}),
+        html.Div(icon,className='kpi-icon',style={'background':f'{color}15','color':color}),
+        html.Div(str(value),className='kpi-value',style={'color':color}),
+        html.Div(label,className='kpi-label')
+    ],className='kpi-card')
 
+def cc(title,sub,fig):
+    return html.Div([html.Div(title,className='chart-title'),html.Div(sub,className='chart-subtitle'),
+        dcc.Graph(figure=fig,config={'displayModeBar':True,'displaylogo':False})],className='chart-card')
 
-def chart_card(title, subtitle, graph_id):
-    return html.Div([
-        html.Div(title, className='chart-title'),
-        html.Div(subtitle, className='chart-subtitle'),
-        dcc.Graph(id=graph_id, config={
-            'displayModeBar': True,
-            'modeBarButtonsToRemove': ['lasso2d', 'select2d'],
-            'scrollZoom': True,
-            'displaylogo': False
-        })
-    ], className='chart-card')
+def fdd(label,did,opts,icon='🔽'):
+    ol=sorted([str(o) for o in opts if pd.notna(o)])
+    return html.Div([html.Div([html.Span(icon+' '),html.Span(label)],className='filter-label'),
+        dcc.Dropdown(id=did,options=[{'label':'All','value':'All'}]+[{'label':o,'value':o} for o in ol],
+            value='All',clearable=False,style={'fontSize':'13px'})],className='filter-group')
 
+def si(label,value,sub='',icon='📊',color='#2563EB'):
+    ch=[html.Div([html.Span(icon+' '),html.Span(label)],className='summary-label'),
+        html.Div(str(value),className='summary-value',style={'color':color})]
+    if sub: ch.append(html.Div(sub,className='summary-sub'))
+    return html.Div(ch,className='summary-item')
 
-def filter_dropdown(label, dd_id, options, icon='🔽'):
-    opt_list = sorted([str(o) for o in options if pd.notna(o)])
-    return html.Div([
-        html.Div([html.Span(icon + ' '), html.Span(label)], className='filter-label'),
-        dcc.Dropdown(
-            id=dd_id,
-            options=[{'label': 'All', 'value': 'All'}] +
-                    [{'label': o, 'value': o} for o in opt_list],
-            value='All', clearable=False,
-            style={'fontSize': '13px'}
-        )
-    ], className='filter-group')
+# Filter options from course_summary
+cs=DATA['course_summary']; ss=DATA['student_success']; sv=DATA['student_survey']
+mod_o=cs['code_module'].unique() if 'code_module' in cs.columns else []
+pres_o=cs['code_presentation'].unique() if 'code_presentation' in cs.columns else []
+risk_o=ss['risk_level'].unique().tolist() if 'risk_level' in ss.columns else []
+stress_o=sorted(sv['stress_level'].dropna().unique().tolist()) if 'stress_level' in sv.columns else []
+wb_o=sv['wellbeing_concern_level'].unique().tolist() if 'wellbeing_concern_level' in sv.columns else []
 
-
-def summary_item(label, value, sub='', icon='📊', color='#2563EB'):
-    children = [
-        html.Div([html.Span(icon + ' '), html.Span(label)], className='summary-label'),
-        html.Div(str(value), className='summary-value', style={'color': color}),
-    ]
-    if sub:
-        children.append(html.Div(sub, className='summary-sub'))
-    return html.Div(children, className='summary-item')
-
-
-# ===========================
-# Build Filter Options from Data
-# ===========================
-df_s = DATA['students']
-df_a = DATA.get('assessments', pd.DataFrame())
-
-module_opts = df_s['code_module'].unique() if 'code_module' in df_s.columns else []
-pres_opts = df_s['code_presentation'].unique() if 'code_presentation' in df_s.columns else []
-gender_opts = ['Male', 'Female']
-age_opts = df_s['age_band'].unique() if 'age_band' in df_s.columns else []
-edu_opts = df_s['highest_education'].unique() if 'highest_education' in df_s.columns else []
-region_opts = df_s['region'].unique() if 'region' in df_s.columns else []
-disability_opts = ['Yes', 'No']
-result_opts = df_s['final_result'].unique() if 'final_result' in df_s.columns else []
-assess_type_opts = df_a['assessment_type'].unique() if len(df_a) > 0 and 'assessment_type' in df_a.columns else []
-
-
-# ===========================
-# Layout
-# ===========================
+# ===== LAYOUT =====
 app.layout = html.Div([
-    # CSS is loaded automatically from assets/styles.css
-
-    # Store for dark mode
-    dcc.Store(id='dark-mode-store', data=False),
-
-    # Interval for clock
-    dcc.Interval(id='clock-interval', interval=1000, n_intervals=0),
-
+    dcc.Store(id='dk',data=False), dcc.Interval(id='clk',interval=1000,n_intervals=0), dcc.Download(id='dl'),
     html.Div([
-        # ========== HEADER ==========
+        # HEADER
         html.Div([
-            html.Div([
-                html.Div([
-                    html.Span('🎓', style={'fontSize': '28px'})
-                ], className='header-logo'),
-                html.Div([
-                    html.Div('Student Performance Analytics Dashboard', className='header-title'),
-                    html.Div('Business Intelligence Dashboard — Open University Learning Analytics Dataset',
-                             className='header-subtitle')
-                ])
-            ], className='header-left'),
-            html.Div([
-                html.Div([
-                    html.Span(id='header-time', style={'fontWeight': '600'}),
-                    html.Span(id='header-date')
-                ], className='header-datetime'),
-                html.Div([
-                    html.Div([
-                        html.Span('☀️', style={'fontSize': '12px'})
-                    ], className='toggle-slider')
-                ], id='dark-toggle', className='dark-toggle', n_clicks=0),
-                html.Div([
-                    html.Span('🏛️', style={'fontSize': '28px'})
-                ], className='header-logo'),
-            ], className='header-right'),
-        ], className='header'),
+            html.Div([html.Div([html.Span('🎓',style={'fontSize':'28px'})],className='header-logo'),
+                html.Div([html.Div('Student Performance Analytics',className='header-title'),
+                    html.Div('Business Intelligence Dashboard — OULAD',className='header-subtitle')])],className='header-left'),
+            html.Div([html.Div([html.Span(id='ht',style={'fontWeight':'600'}),html.Span(id='hd')],className='header-datetime'),
+                html.Div([html.Div([html.Span('☀️',style={'fontSize':'12px'})],className='toggle-slider')],id='dt',className='dark-toggle',n_clicks=0),
+                html.Div([html.Span('🏛️',style={'fontSize':'28px'})],className='header-logo')],className='header-right'),
+        ],className='header'),
 
-        # ========== SIDEBAR ==========
+        # SIDEBAR
         html.Div([
-            html.Div([html.Span('⚙️ '), html.Span('Filters')], className='sidebar-title'),
-            filter_dropdown('Course Module', 'filter-module', module_opts, '📚'),
-            filter_dropdown('Course Presentation', 'filter-presentation', pres_opts, '📅'),
-            filter_dropdown('Gender', 'filter-gender', gender_opts, '👤'),
-            filter_dropdown('Age Band', 'filter-age', age_opts, '📊'),
-            filter_dropdown('Highest Education', 'filter-education', edu_opts, '🎓'),
-            filter_dropdown('Region', 'filter-region', region_opts, '🌍'),
-            filter_dropdown('Disability', 'filter-disability', disability_opts, '♿'),
-            filter_dropdown('Final Result', 'filter-result', result_opts, '✅'),
-            filter_dropdown('Assessment Type', 'filter-assess-type', assess_type_opts, '📝'),
-            html.Button([
-                html.Span('🔄 '), html.Span('Reset All Filters')
-            ], id='reset-btn', className='reset-btn', n_clicks=0)
-        ], className='sidebar'),
-
-        # ========== MAIN CONTENT ==========
-        html.Div([
-            # KPI Row
-            html.Div([
-                kpi_card('👥', 'Total Students', f"{KPIS['total_students']:,}",
-                         '+12.5%', 'up', COLORS['kpi_blue']),
-                kpi_card('📚', 'Total Courses', str(KPIS['total_courses']),
-                         '+3 new', 'up', COLORS['kpi_purple']),
-                kpi_card('📊', 'Avg Assessment Score', str(KPIS['avg_score']),
-                         '+2.3%', 'up', COLORS['kpi_green']),
-                kpi_card('✅', 'Student Pass Rate', f"{KPIS['pass_rate']}%",
-                         '+4.1%', 'up', COLORS['kpi_teal']),
-                kpi_card('⚠️', 'Withdrawal Rate', f"{KPIS['withdrawal_rate']}%",
-                         '-1.8%', 'down', COLORS['kpi_orange']),
-                kpi_card('📈', 'Avg Engagement', f"{int(KPIS['avg_engagement']):,}",
-                         '+8.2%', 'up', COLORS['kpi_blue']),
-            ], className='kpi-row'),
-
-            # Row 1: Pass Rate | Assessment Scores | Final Results
-            html.Div([
-                chart_card('📊 Course-wise Pass Rate',
-                           'Horizontal bar chart showing pass rate by module', 'chart-pass-rate'),
-                chart_card('📝 Avg Score by Assessment Type',
-                           'Grouped bar chart with error bars', 'chart-assess-type'),
-                chart_card('🎯 Student Final Results',
-                           'Distribution of outcomes across all students', 'chart-final-results'),
-            ], className='chart-row three-col'),
-
-            # Row 2: Gender | Age Band | Education
-            html.Div([
-                chart_card('👤 Gender Distribution', 'Student gender breakdown', 'chart-gender'),
-                chart_card('📊 Age Band Distribution', 'Students grouped by age range', 'chart-age'),
-                chart_card('🎓 Highest Education', 'Education level distribution', 'chart-education'),
-            ], className='chart-row three-col'),
-
-            # Row 3: Engagement Scatter
-            html.Div([
-                chart_card('🔬 Student Engagement vs Assessment Score',
-                           'Bubble size = number of assessments · Color = final result',
-                           'chart-engagement'),
-            ], className='chart-row full'),
-
-            # Row 4: Daily Activity
-            html.Div([
-                chart_card('📈 Average Daily Student Activity',
-                           'VLE interaction trends over the study period with 7-day rolling average',
-                           'chart-daily-activity'),
-            ], className='chart-row full'),
-
-            # Row 5: Top Resources
-            html.Div([
-                chart_card('🏆 Top 10 Learning Resources',
-                           'Most accessed VLE resources by total click count',
-                           'chart-top-resources'),
-            ], className='chart-row full'),
-
-        ], className='main-content'),
-
-        # ========== RIGHT PANEL ==========
-        html.Div([
-            html.Div('📋 Performance Summary', className='panel-title'),
-            summary_item('Best Performing Course', f"Module {SUMMARY['best_course']}",
-                         f"Pass Rate: {SUMMARY['best_course_rate']}%", '🏆', '#10B981'),
-            summary_item('Lowest Performing Course', f"Module {SUMMARY['worst_course']}",
-                         f"Pass Rate: {SUMMARY['worst_course_rate']}%", '📉', '#EF4444'),
-            summary_item('Highest Engagement Module', f"Module {SUMMARY['high_engage']}",
-                         f"Total Clicks: {SUMMARY['high_engage_val']:,}", '🔥', '#2563EB'),
-            summary_item('Lowest Engagement Module', f"Module {SUMMARY['low_engage']}",
-                         f"Total Clicks: {SUMMARY['low_engage_val']:,}", '❄️', '#64748B'),
-            summary_item('Students at Risk', f"{SUMMARY['at_risk']:,}",
-                         'Students with Fail or Withdrawn status', '⚠️', '#EF4444'),
-            summary_item('Overall Pass Percentage', f"{SUMMARY['overall_pass']}%",
-                         'Including Pass and Distinction', '✅', '#10B981'),
-
-            html.Hr(style={'border': 'none', 'borderTop': '1px solid #E2E8F0', 'margin': '20px 0'}),
-
-            html.Div('📊 Quick Stats', className='panel-title', style={'marginTop': '8px'}),
-            summary_item('Total Assessments',
-                         f"{len(DATA.get('student_assessments', [])):,}",
-                         '', '📝', '#8B5CF6'),
-            summary_item('VLE Interactions',
-                         f"{len(DATA.get('student_vle', [])):,}",
-                         '', '💻', '#2563EB'),
-            summary_item('Unique Regions',
-                         str(df_s['region'].nunique()) if 'region' in df_s.columns else '0',
-                         '', '🌍', '#14B8A6'),
-        ], className='right-panel'),
-
-        # ========== FOOTER ==========
-        html.Div([
-            html.Div([
-                html.Span('Generated using '),
-                html.A('Python Dash', href='https://dash.plotly.com/', target='_blank',
-                       style={'color': '#93C5FD', 'fontWeight': '600'}),
-                html.Span(' & '),
-                html.A('Plotly', href='https://plotly.com/', target='_blank',
-                       style={'color': '#93C5FD', 'fontWeight': '600'}),
+            html.Div([html.Span('⚙️ '),html.Span('Filters')],className='sidebar-title'),
+            fdd('Course Module','f-mod',mod_o,'📚'), fdd('Semester','f-pres',pres_o,'📅'),
+            # Intervention-specific
+            html.Div(id='intv-filters',children=[
+                fdd('Risk Level','f-risk',risk_o,'⚠️'),
+                html.Div([html.Div([html.Span('🔍 '),html.Span('Search Student ID')],className='filter-label'),
+                    dcc.Input(id='f-search',type='text',placeholder='Enter Student ID...',debounce=True,
+                        style={'width':'100%','padding':'8px','borderRadius':'8px','border':'1px solid #E2E8F0','fontSize':'13px'})
+                ],className='filter-group'),
             ]),
-            html.Div([
-                html.Span('Data Source: '),
-                html.A('Open University Learning Analytics Dataset (OULAD)',
-                       href='https://analyse.kmi.open.ac.uk/open_dataset',
-                       target='_blank', style={'color': '#93C5FD', 'fontWeight': '600'}),
-            ])
-        ], className='footer'),
-    ], className='dashboard-container', id='dashboard-container')
+            # Diagnostic-specific
+            html.Div(id='diag-filters',children=[
+                fdd('Stress Level','f-stress',stress_o,'🧠'),
+                fdd('Wellbeing','f-wb',wb_o,'❤️'),
+            ]),
+            html.Button([html.Span('🔄 '),html.Span('Reset Filters')],id='rbtn',className='reset-btn',n_clicks=0),
+        ],className='sidebar'),
+
+        # MAIN
+        html.Div([
+            dcc.Tabs(id='tabs',value='executive',className='custom-tabs',children=[
+                dcc.Tab(label='📊 Executive',value='executive',className='custom-tab',selected_className='custom-tab--selected'),
+                dcc.Tab(label='🛡️ Intervention',value='intervention',className='custom-tab',selected_className='custom-tab--selected'),
+                dcc.Tab(label='🔬 Diagnostic',value='diagnostic',className='custom-tab',selected_className='custom-tab--selected'),
+                dcc.Tab(label='📈 Cross-Analysis',value='cross',className='custom-tab',selected_className='custom-tab--selected'),
+            ]),
+            dcc.Loading(html.Div(id='tc'),type='default')
+        ],className='main-content'),
+
+        # RIGHT PANEL
+        html.Div(id='rp',className='right-panel'),
+
+        # FOOTER
+        html.Div([html.Span('Student Performance BI System — Dash & Plotly'),
+            html.Span(f'Data Trust Score: {DQ["trust_score"]}%',style={'fontWeight':'600'})],className='footer'),
+    ],className='dashboard-container',id='dc')
 ])
 
+# ===== CALLBACKS =====
+@app.callback([Output('ht','children'),Output('hd','children')],Input('clk','n_intervals'))
+def _clk(_): n=datetime.now(); return n.strftime('%H:%M:%S'),n.strftime('%A, %B %d, %Y')
 
-# ===========================
-# Callbacks
-# ===========================
+@app.callback([Output('dk','data'),Output('dt','className')],Input('dt','n_clicks'),State('dk','data'))
+def _dk(n,c): v=not c if n and n>0 else c; return v,'dark-toggle active' if v else 'dark-toggle'
 
-# Clock update
-@app.callback(
-    [Output('header-time', 'children'),
-     Output('header-date', 'children')],
-    Input('clock-interval', 'n_intervals')
-)
-def update_clock(_):
-    now = datetime.now()
-    return now.strftime('%H:%M:%S'), now.strftime('%A, %B %d, %Y')
+app.clientside_callback("function(d){document.body.classList.toggle('dark-mode',d);return '';}",Output('dc','data-dark'),Input('dk','data'))
 
+@app.callback([Output('f-mod','value'),Output('f-pres','value'),Output('f-risk','value'),
+    Output('f-search','value'),Output('f-stress','value'),Output('f-wb','value')],
+    Input('rbtn','n_clicks'),prevent_initial_call=True)
+def _rst(_): return 'All','All','All','','All','All'
 
-# Dark mode toggle
-@app.callback(
-    [Output('dark-mode-store', 'data'),
-     Output('dark-toggle', 'className')],
-    Input('dark-toggle', 'n_clicks'),
-    State('dark-mode-store', 'data')
-)
-def toggle_dark(n, current):
-    if n and n > 0:
-        new_val = not current
+# Show/hide tab-specific filters
+@app.callback([Output('intv-filters','style'),Output('diag-filters','style')],Input('tabs','value'))
+def _fvis(tab):
+    intv={'display':'block'} if tab=='intervention' else {'display':'none'}
+    diag={'display':'block'} if tab=='diagnostic' else {'display':'none'}
+    return intv, diag
+
+# ===== MAIN RENDER =====
+@app.callback([Output('tc','children'),Output('rp','children')],
+    [Input('tabs','value'),Input('f-mod','value'),Input('f-pres','value'),
+     Input('f-risk','value'),Input('f-search','value'),
+     Input('f-stress','value'),Input('f-wb','value'),Input('dk','data')])
+def render(tab,mod,pres,risk,search,stress,wb,dk):
+    # Filter each collection
+    fcs = filter_by(DATA['course_summary'].copy(), mod, pres)
+    fss = filter_by(DATA['student_success'].copy(), mod, pres)
+    fsv = filter_by(DATA['student_survey'].copy(), mod, pres)
+
+    # Extra intervention filters
+    if risk!='All' and 'risk_level' in fss.columns: fss=fss[fss['risk_level']==risk]
+    if search and 'id_student' in fss.columns: fss=fss[fss['id_student'].astype(str).str.contains(str(search),na=False)]
+
+    # Extra diagnostic filters
+    if stress!='All' and 'stress_level' in fsv.columns:
+        fsv=fsv[fsv['stress_level'].astype(str)==str(stress)]
+    if wb!='All' and 'wellbeing_concern_level' in fsv.columns:
+        fsv=fsv[fsv['wellbeing_concern_level']==wb]
+
+    # ===== RIGHT PANEL =====
+    rp=[]
+    if tab=='executive':
+        rp=[html.Div('📋 Executive Summary',className='panel-title'),
+            si('Total Courses',EK['total_courses'],'Active modules','📚',CL['p']),
+            si('Pass Rate',f"{EK['pass_rate']}%",'Overall','✅',CL['g']),
+            si('Withdrawal',f"{EK['withdrawal_rate']}%",'Overall','📉',CL['o']),
+            si('Health Index',EK['health_index'],'Pass% − Withdrawal%','💚',CL['t']),
+            si('Avg Score',f"{EK['avg_score']}%",'All courses','📊',CL['b'])]
+    elif tab=='intervention':
+        rp=[html.Div('🛡️ Actions Required',className='panel-title'),
+            si('High Risk',f"{IK['high_risk']:,}",'Immediate contact','🚨',CL['r']),
+            si('Medium Risk',f"{IK['medium_risk']:,}",'Monitor','⚠️',CL['o']),
+            si('Low Risk',f"{IK['low_risk']:,}",'On track','✅',CL['g']),
+            si('Avg Attendance',f"{IK['avg_attendance']}",'Active days','📅',CL['b'])]
+    elif tab=='diagnostic':
+        rp=[html.Div('🔬 Root Cause KPIs',className='panel-title'),
+            si('Avg Stress',f"{DK['avg_stress']}/5",'Stress level','🧠',CL['o']),
+            si('Satisfaction',f"{DK['avg_satisfaction']}/5",'Overall','❤️',CL['t']),
+            si('LMS Rating',f"{DK['avg_lms']}/5",'Usefulness','💻',CL['b']),
+            si('High Concern',f"{DK['high_concern']:,}",'Wellbeing flagged','🚩',CL['r'])]
     else:
-        new_val = current
-    cls = 'dark-toggle active' if new_val else 'dark-toggle'
-    return new_val, cls
+        rp=[html.Div('📈 Data Quality',className='panel-title'),
+            si('Trust Score',f"{DQ['trust_score']}%",'Data reliability','🛡️',CL['g']),
+            si('Missing',f"{DQ['missing_pct']}%",'Null values','📋',CL['o']),
+            si('Duplicates',f"{DQ['duplicate_pct']}%",'Duplicate rows','📋',CL['r'])]
 
+    # ===== TAB CONTENT =====
+    if tab=='executive':
+        content=html.Div([
+            html.Div([kpi('📚','Total Courses',EK['total_courses'],CL['p']),
+                kpi('✅','Pass Rate',f"{EK['pass_rate']}%",CL['g']),
+                kpi('📉','Withdrawal',f"{EK['withdrawal_rate']}%",CL['o']),
+                kpi('📊','Avg Score',f"{EK['avg_score']}%",CL['b']),
+                kpi('🚨','Risk Density',f"{EK['risk_density']}%",CL['r']),
+                kpi('📈','Avg Engagement',f"{int(EK['avg_engagement']):,}",CL['i']),
+                kpi('💚','Health Index',EK['health_index'],CL['t'])
+            ],className='kpi-row',style={'gridTemplateColumns':'repeat(4,1fr)'}),
+            html.Div([cc('📊 Course Performance Analysis','Pass, Fail & Withdrawal rates by module',exec_course_health(fcs,dk)),
+                cc('🎯 Student Outcome Distribution','Overall academic outcomes',exec_outcome_donut(fcs,dk))],className='chart-row two-col'),
+            html.Div([cc('💡 Resource Efficiency','LMS Clicks vs Pass Rate',exec_resource_efficiency(fcs,dk)),
+                cc('⚠️ Risk Density by Course','High-risk student concentration',exec_risk_density(fcs,dk))],className='chart-row two-col'),
+            html.Div([cc('📈 Performance Trends','Score & rate trends across semesters',exec_performance_trend(fcs,dk))],className='chart-row full'),
+        ])
 
-# Dark mode body class
-app.clientside_callback(
-    """
-    function(dark) {
-        if (dark) {
-            document.body.classList.add('dark-mode');
-        } else {
-            document.body.classList.remove('dark-mode');
-        }
-        return '';
-    }
-    """,
-    Output('dashboard-container', 'data-dark'),
-    Input('dark-mode-store', 'data')
-)
+    elif tab=='intervention':
+        ar=get_at_risk_table(DATA,mod,pres,risk,search)
+        ar_d=ar.to_dict('records') if len(ar)>0 else []
+        ar_c=[{'name':c.replace('_',' ').title(),'id':c} for c in ar.columns] if len(ar)>0 else []
+        content=html.Div([
+            html.Div([kpi('🚨','High Risk',f"{IK['high_risk']:,}",CL['r']),
+                kpi('⚠️','Medium Risk',f"{IK['medium_risk']:,}",CL['o']),
+                kpi('✅','Low Risk',f"{IK['low_risk']:,}",CL['g']),
+                kpi('📈','Avg Engagement',f"{int(IK['avg_engagement']):,}",CL['b']),
+                kpi('📅','Avg Attendance',f"{int(IK['avg_attendance'])}",CL['t']),
+                kpi('📉','Predicted WD',f"{IK['predicted_wd']:,}",CL['pk']),
+                kpi('🔔','Immediate',f"{IK['immediate']:,}",CL['r'])
+            ],className='kpi-row',style={'gridTemplateColumns':'repeat(4,1fr)'}),
+            # Watchlist
+            html.Div([html.Div([html.Div([html.Div('🚨 At-Risk Student Watchlist',className='chart-title',style={'color':'#EF4444'}),
+                    html.Div('Students requiring intervention — sortable, filterable, exportable',className='chart-subtitle')],
+                    style={'flex':'1'}),
+                html.Button([html.Span('📥 '),html.Span('Export CSV')],id='exp',className='export-btn',n_clicks=0)],
+                style={'display':'flex','justifyContent':'space-between','alignItems':'flex-start','marginBottom':'12px'}),
+                dash_table.DataTable(data=ar_d,columns=ar_c,page_size=12,sort_action='native',filter_action='native',
+                    style_table={'overflowX':'auto'},
+                    style_header={'backgroundColor':'#1E293B' if dk else '#F8FAFC','color':'#F1F5F9' if dk else '#475569',
+                        'fontWeight':'700','fontSize':'11px','textTransform':'uppercase','borderBottom':'2px solid '+('#334155' if dk else '#E2E8F0')},
+                    style_data={'backgroundColor':'#0F172A' if dk else '#fff','color':'#F1F5F9' if dk else '#1E293B','fontSize':'13px'},
+                    style_cell={'padding':'10px 14px','border':'none'},
+                    style_data_conditional=[{'if':{'row_index':'odd'},'backgroundColor':'#1E293B' if dk else '#F8FAFC'}])
+            ],className='chart-card',style={'gridColumn':'1/-1'}),
+            html.Div([cc('🎯 Risk Distribution','Student risk composition',intv_risk_donut(fss,dk)),
+                cc('📊 Engagement vs Performance','Score by engagement level',intv_engage_vs_perf(fss,dk))],className='chart-row two-col'),
+            html.Div([cc('🕵️ Silent Struggler Analysis','Low engagement + mid scores',intv_silent_struggler(fss,dk)),
+                cc('📊 Risk by Category','Student count per risk level',intv_risk_by_category(fss,dk))],className='chart-row two-col'),
+        ])
 
+    elif tab=='diagnostic':
+        content=html.Div([
+            html.Div([kpi('🧠','Avg Stress',f"{DK['avg_stress']}/5",CL['o']),
+                kpi('❤️','Wellbeing',f"{DK['avg_wellbeing']}/5",CL['t']),
+                kpi('💻','LMS Usefulness',f"{DK['avg_lms']}/5",CL['b']),
+                kpi('⭐','Satisfaction',f"{DK['avg_satisfaction']}/5",CL['g']),
+                kpi('🚩','High Concern',f"{DK['high_concern']:,}",CL['r']),
+                kpi('📊','Avg Performance',DK['avg_performance'],CL['p'])
+            ],className='kpi-row',style={'gridTemplateColumns':'repeat(3,1fr)'}),
+            html.Div([cc('📉 Stress vs Performance','Impact of stress on scores',diag_stress_vs_perf(fsv,dk)),
+                cc('💬 Wellbeing Concern Analysis','Score by wellbeing level',diag_wellbeing_bar(fsv,dk))],className='chart-row two-col'),
+            html.Div([cc('💻 LMS Friction Analysis','Platform usefulness vs usage',diag_lms_friction(fsv,dk)),
+                cc('🧩 Sentiment Distribution','Overall wellbeing composition',diag_sentiment_pie(fsv,dk))],className='chart-row two-col'),
+            html.Div([cc('🔗 Correlation Matrix','Success factor relationships',diag_correlation(fsv,dk))],className='chart-row full'),
+        ])
 
-# Reset filters
-@app.callback(
-    [Output('filter-module', 'value'),
-     Output('filter-presentation', 'value'),
-     Output('filter-gender', 'value'),
-     Output('filter-age', 'value'),
-     Output('filter-education', 'value'),
-     Output('filter-region', 'value'),
-     Output('filter-disability', 'value'),
-     Output('filter-result', 'value'),
-     Output('filter-assess-type', 'value')],
-    Input('reset-btn', 'n_clicks'),
-    prevent_initial_call=True
-)
-def reset_filters(_):
-    return ['All'] * 9
+    else:  # cross
+        sgd=cross_success_gap(DATA)
+        sg_d=sgd.to_dict('records') if len(sgd)>0 else []
+        sg_c=[{'name':c.replace('_',' ').title(),'id':c} for c in sgd.columns] if len(sgd)>0 else []
+        dq_d=DQ.get('tables',[])
+        dq_c=[{'name':k.replace('_',' ').title(),'id':k} for k in ['table','rows','columns','missing_pct','duplicates']] if dq_d else []
+        content=html.Div([
+            html.Div([kpi('🛡️','Trust Score',f"{DQ['trust_score']}%",CL['g']),
+                kpi('📋','Missing',f"{DQ['missing_pct']}%",CL['o']),
+                kpi('📋','Duplicates',f"{DQ['duplicate_pct']}%",CL['r'])
+            ],className='kpi-row',style={'gridTemplateColumns':'repeat(3,1fr)'}),
+            html.Div([html.Div('🔍 Success Gap Analysis',className='chart-title'),
+                html.Div('Average metrics by risk level — stress, engagement, attendance',className='chart-subtitle'),
+                dash_table.DataTable(data=sg_d,columns=sg_c,page_size=10,
+                    style_header={'backgroundColor':'#1E293B' if dk else '#F8FAFC','color':'#F1F5F9' if dk else '#475569','fontWeight':'700'},
+                    style_data={'backgroundColor':'#0F172A' if dk else '#fff','color':'#F1F5F9' if dk else '#1E293B'},
+                    style_cell={'padding':'10px 14px','border':'none'})],className='chart-card'),
+            html.Div([cc('📉 Retention Funnel','Enrolled → Passed → Failed → Withdrawn',cross_retention_funnel(fcs,dk))],className='chart-row full'),
+            html.Div([html.Div('🛡️ Data Quality Report',className='chart-title'),
+                html.Div('Source collection audit',className='chart-subtitle'),
+                dash_table.DataTable(data=dq_d,columns=dq_c,page_size=10,
+                    style_header={'backgroundColor':'#1E293B' if dk else '#F8FAFC','color':'#F1F5F9' if dk else '#475569','fontWeight':'700'},
+                    style_data={'backgroundColor':'#0F172A' if dk else '#fff','color':'#F1F5F9' if dk else '#1E293B'},
+                    style_cell={'padding':'10px 14px','border':'none'})],className='chart-card'),
+        ])
 
+    return content, rp
 
-# Main chart update callback
-@app.callback(
-    [Output('chart-pass-rate', 'figure'),
-     Output('chart-assess-type', 'figure'),
-     Output('chart-final-results', 'figure'),
-     Output('chart-gender', 'figure'),
-     Output('chart-age', 'figure'),
-     Output('chart-education', 'figure'),
-     Output('chart-engagement', 'figure'),
-     Output('chart-daily-activity', 'figure'),
-     Output('chart-top-resources', 'figure')],
-    [Input('filter-module', 'value'),
-     Input('filter-presentation', 'value'),
-     Input('filter-gender', 'value'),
-     Input('filter-age', 'value'),
-     Input('filter-education', 'value'),
-     Input('filter-region', 'value'),
-     Input('filter-disability', 'value'),
-     Input('filter-result', 'value'),
-     Input('filter-assess-type', 'value'),
-     Input('dark-mode-store', 'data')]
-)
-def update_charts(module, presentation, gender, age, education, region,
-                  disability, result, assess_type, dark):
-    # Filter students
-    df = DATA['students'].copy()
+# CSV Export
+@app.callback(Output('dl','data'),Input('exp','n_clicks'),
+    [State('f-mod','value'),State('f-pres','value'),State('f-risk','value'),State('f-search','value')],
+    prevent_initial_call=True)
+def export(n,mod,pres,risk,search):
+    if not n: return dash.no_update
+    ar=get_at_risk_table(DATA,mod,pres,risk,search)
+    return dcc.send_data_frame(ar.to_csv,'at_risk_students.csv',index=False) if len(ar)>0 else dash.no_update
 
-    if module != 'All' and 'code_module' in df.columns:
-        df = df[df['code_module'] == module]
-    if presentation != 'All' and 'code_presentation' in df.columns:
-        df = df[df['code_presentation'] == presentation]
-    if gender != 'All' and 'gender' in df.columns:
-        g_map = {'Male': 'M', 'Female': 'F'}
-        df = df[df['gender'] == g_map.get(gender, gender)]
-    if age != 'All' and 'age_band' in df.columns:
-        df = df[df['age_band'] == age]
-    if education != 'All' and 'highest_education' in df.columns:
-        df = df[df['highest_education'] == education]
-    if region != 'All' and 'region' in df.columns:
-        df = df[df['region'] == region]
-    if disability != 'All' and 'disability' in df.columns:
-        d_map = {'Yes': 'Y', 'No': 'N'}
-        df = df[df['disability'] == d_map.get(disability, disability)]
-    if result != 'All' and 'final_result' in df.columns:
-        df = df[df['final_result'] == result]
-
-    student_ids = df['id_student'].unique() if 'id_student' in df.columns else []
-
-    # Filter related tables
-    df_sa = DATA.get('student_assessments', pd.DataFrame())
-    df_svle = DATA.get('student_vle', pd.DataFrame())
-    df_assess = DATA.get('assessments', pd.DataFrame()).copy()
-    df_vle = DATA.get('vle', pd.DataFrame())
-
-    if len(df_sa) > 0 and 'id_student' in df_sa.columns and len(student_ids) > 0:
-        df_sa = df_sa[df_sa['id_student'].isin(student_ids)]
-    if len(df_svle) > 0 and 'id_student' in df_svle.columns and len(student_ids) > 0:
-        df_svle = df_svle[df_svle['id_student'].isin(student_ids)]
-
-    if assess_type != 'All' and len(df_assess) > 0 and 'assessment_type' in df_assess.columns:
-        assess_ids = df_assess[df_assess['assessment_type'] == assess_type]['id_assessment']
-        if len(df_sa) > 0 and 'id_assessment' in df_sa.columns:
-            df_sa = df_sa[df_sa['id_assessment'].isin(assess_ids)]
-
-    if module != 'All':
-        if len(df_assess) > 0 and 'code_module' in df_assess.columns:
-            df_assess = df_assess[df_assess['code_module'] == module]
-        if len(df_svle) > 0 and 'code_module' in df_svle.columns:
-            df_svle = df_svle[df_svle['code_module'] == module]
-
-    # Build filtered data dict for charts that need multiple tables
-    filtered_data = {
-        'students': df,
-        'student_assessments': df_sa,
-        'student_vle': df_svle,
-        'assessments': df_assess,
-        'course_summary': DATA.get('course_summary', pd.DataFrame()),
-        'vle': DATA.get('vle', pd.DataFrame()),
-    }
-
-    # Build all charts
-    fig1 = build_course_pass_rate(df, dark)
-    fig2 = build_assessment_score_by_type(filtered_data, dark)
-    fig3 = build_final_results_donut(df, dark)
-    fig4 = build_gender_pie(df, dark)
-    fig5 = build_age_band_bar(df, dark)
-    fig6 = build_education_bar(df, dark)
-    fig7 = build_engagement_scatter(filtered_data, df, dark)
-    fig8 = build_daily_activity(filtered_data, student_ids, dark)
-    fig9 = build_top_resources(filtered_data, student_ids, dark)
-
-    return fig1, fig2, fig3, fig4, fig5, fig6, fig7, fig8, fig9
-
-
-# ===========================
-# Run Server
-# ===========================
-if __name__ == '__main__':
-    print("\n🚀 Dashboard starting at http://127.0.0.1:8050")
-    print("   Press Ctrl+C to stop.\n")
+if __name__=='__main__':
+    print("\n🚀 http://127.0.0.1:8050\n")
     app.run(debug=True, port=8050)
